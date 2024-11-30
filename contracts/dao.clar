@@ -1,123 +1,128 @@
-;; Define trait for executable proposals
-(use-trait proposal-trait .proposal-trait.proposal-trait)
+;; OpenSoverign DAO Contract
+;; Implements basic DAO functionality including proposals, voting, and token management
 
-;; Define constants
+(define-constant CONTRACT-OWNER tx-sender)
 (define-constant ERR-NOT-AUTHORIZED (err u100))
-(define-constant ERR-ALREADY-MEMBER (err u101))
-(define-constant ERR-NOT-MEMBER (err u102))
-(define-constant ERR-PROPOSAL-NOT-FOUND (err u103))
-(define-constant ERR-ALREADY-VOTED (err u104))
-(define-constant ERR-VOTING-CLOSED (err u105))
+(define-constant ERR-PROPOSAL-NOT-FOUND (err u101))
+(define-constant ERR-INVALID-VOTE (err u102))
+(define-constant ERR-ALREADY-VOTED (err u103))
+(define-constant ERR-PROPOSAL-EXPIRED (err u104))
+(define-constant VOTING-PERIOD u144) ;; ~24 hours in blocks (assuming 10 min block time)
 
 ;; Define data variables
+(define-data-var total-supply uint u1000000) ;; Initial token supply
 (define-data-var proposal-count uint u0)
 
 ;; Define data maps
-(define-map members principal bool)
-(define-map proposals 
-  uint 
-  { 
-    proposer: principal, 
-    description: (string-utf8 256), 
-    votes-for: uint, 
-    votes-against: uint, 
-    status: (string-utf8 20),
-    execution-function: (optional principal)
-  }
+(define-map proposals
+    uint
+    {
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        proposer: principal,
+        start-block: uint,
+        end-block: uint,
+        yes-votes: uint,
+        no-votes: uint,
+        executed: bool
+    }
 )
+
+(define-map balances principal uint)
 (define-map votes {proposal-id: uint, voter: principal} bool)
 
-;; Contract owner
-(define-data-var contract-owner principal tx-sender)
-
-;; Functions
-
-;; Add a new member
-(define-public (add-member (new-member principal))
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (asserts! (is-none (map-get? members new-member)) ERR-ALREADY-MEMBER)
-    (ok (map-set members new-member true))
-  )
-)
-
-;; Create a new proposal
-(define-public (create-proposal (description (string-utf8 256)) (execution-function (optional principal)))
-  (let ((proposal-id (+ (var-get proposal-count) u1)))
-    (asserts! (is-some (map-get? members tx-sender)) ERR-NOT-MEMBER)
-    (map-set proposals proposal-id 
-      {
-        proposer: tx-sender,
-        description: description,
-        votes-for: u0,
-        votes-against: u0,
-        status: u"active",
-        execution-function: execution-function
-      }
+;; Initialize contract
+(define-private (initialize)
+    (begin
+        (map-set balances CONTRACT-OWNER (var-get total-supply))
+        (ok true)
     )
-    (var-set proposal-count proposal-id)
-    (ok proposal-id)
-  )
 )
 
-;; Vote on a proposal
-(define-public (vote (proposal-id uint) (vote-for bool))
-  (let (
-    (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
-    (has-voted (default-to false (map-get? votes {proposal-id: proposal-id, voter: tx-sender})))
-  )
-    (asserts! (is-some (map-get? members tx-sender)) ERR-NOT-MEMBER)
-    (asserts! (not has-voted) ERR-ALREADY-VOTED)
-    (asserts! (is-eq (get status proposal) u"active") ERR-VOTING-CLOSED)
-    (map-set votes {proposal-id: proposal-id, voter: tx-sender} true)
-    (if vote-for
-      (map-set proposals proposal-id (merge proposal {votes-for: (+ (get votes-for proposal) u1)}))
-      (map-set proposals proposal-id (merge proposal {votes-against: (+ (get votes-against proposal) u1)}))
+;; Token transfer function
+(define-public (transfer (amount uint) (recipient principal))
+    (let ((sender-balance (default-to u0 (map-get? balances tx-sender))))
+        (if (>= sender-balance amount)
+            (begin
+                (map-set balances tx-sender (- sender-balance amount))
+                (map-set balances recipient (+ (default-to u0 (map-get? balances recipient)) amount))
+                (ok true)
+            )
+            (err u1) ;; Insufficient balance
+        )
     )
-    (ok true)
-  )
 )
 
-;; Close voting on a proposal
-(define-public (close-voting (proposal-id uint))
-  (let (
-    (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
-  )
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (asserts! (is-eq (get status proposal) u"active") ERR-VOTING-CLOSED)
-    (if (> (get votes-for proposal) (get votes-against proposal))
-      (map-set proposals proposal-id (merge proposal {status: u"approved"}))
-      (map-set proposals proposal-id (merge proposal {status: u"rejected"}))
+;; Create new proposal
+(define-public (create-proposal (title (string-ascii 100)) (description (string-ascii 500)))
+    (let (
+        (proposal-id (var-get proposal-count))
+        (start-block block-height)
+        (end-block (+ block-height VOTING-PERIOD))
     )
-    (ok true)
-  )
+        (begin
+            (map-set proposals proposal-id {
+                title: title,
+                description: description,
+                proposer: tx-sender,
+                start-block: start-block,
+                end-block: end-block,
+                yes-votes: u0,
+                no-votes: u0,
+                executed: false
+            })
+            (var-set proposal-count (+ proposal-id u1))
+            (ok proposal-id)
+        )
+    )
 )
 
-;; Execute an approved proposal
-(define-public (execute-proposal (proposal-id uint) (executable <proposal-trait>))
-  (let (
-    (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
-  )
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (asserts! (is-eq (get status proposal) u"approved") ERR-NOT-AUTHORIZED)
-    (asserts! (is-eq (some (contract-of executable)) (get execution-function proposal)) ERR-NOT-AUTHORIZED)
-    (contract-call? executable execute)
-  )
+;; Cast vote on proposal
+(define-public (vote (proposal-id uint) (support bool))
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+        (voter-balance (default-to u0 (map-get? balances tx-sender)))
+    )
+        (asserts! (>= block-height (get start-block proposal)) ERR-INVALID-VOTE)
+        (asserts! (<= block-height (get end-block proposal)) ERR-PROPOSAL-EXPIRED)
+        (asserts! (not (default-to false (map-get? votes {proposal-id: proposal-id, voter: tx-sender}))) ERR-ALREADY-VOTED)
+        
+        (begin
+            (map-set votes {proposal-id: proposal-id, voter: tx-sender} true)
+            (if support
+                (map-set proposals proposal-id 
+                    (merge proposal {yes-votes: (+ (get yes-votes proposal) voter-balance)}))
+                (map-set proposals proposal-id 
+                    (merge proposal {no-votes: (+ (get no-votes proposal) voter-balance)}))
+            )
+            (ok true)
+        )
+    )
 )
 
-;; Read-only functions
-
-;; Check if an address is a member
-(define-read-only (is-member (address principal))
-  (default-to false (map-get? members address))
-)
-
-;; Get proposal details
+;; Read proposal details
 (define-read-only (get-proposal (proposal-id uint))
-  (map-get? proposals proposal-id)
+    (map-get? proposals proposal-id)
 )
 
-;; Get the total number of proposals
-(define-read-only (get-proposal-count)
-  (var-get proposal-count)
+;; Get voter balance
+(define-read-only (get-balance (account principal))
+    (default-to u0 (map-get? balances account))
+)
+
+;; Execute proposal
+(define-public (execute-proposal (proposal-id uint))
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+    )
+        (asserts! (> block-height (get end-block proposal)) ERR-PROPOSAL-NOT-FOUND)
+        (asserts! (not (get executed proposal)) (err u105))
+        (asserts! (> (get yes-votes proposal) (get no-votes proposal)) (err u106))
+        
+        (begin
+            (map-set proposals proposal-id (merge proposal {executed: true}))
+            ;; Add custom execution logic here
+            (ok true)
+        )
+    )
 )
